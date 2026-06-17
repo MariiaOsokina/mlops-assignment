@@ -95,18 +95,75 @@ memory sits idle, so the backlog grows without bound.
   P50 46.9s→2.5s, ok 723→2612, client_errors 775→0, timeouts 1098→8.** The agent
   process was the true bottleneck. Median now meets the 5s SLO; the P95 tail
   (11.8s) still misses by ~2.4×.
-- **Iter 3 (optional tradeoff demo):** _____
+- **Iter 3:** saw the residual P95 tail (11.8s) was driven by multi-iteration
+  requests (up to 5 sequential vLLM calls each) → hypothesized capping the loop
+  removes the long tail → changed `MAX_ITERATIONS` 3 → 1 → **result: P95
+  11.8s→3.83s (SLO HIT), P50 2.5s→1.5s, achieved 9.35 RPS, 0 client errors.**
+  Confirmed quality cost separately: pass rate 40%→33.3% (the loop's +6.7 points
+  are lost because no revision ever happens).
 
-**Final config:**
+**The speed↔quality tradeoff (measured):**
+
+| Config | P95 | Achieved RPS | Quality | SLO |
+|---|---|---|---|---|
+| `MAX_ITER=3` + workers=4 | 11.8s | 8.4 | 40.0% | ❌ miss (2.4×) |
+| `MAX_ITER=1` + workers=4 | **3.83s** | **9.35** | 33.3% | ✅ **hit** |
+
+The verify→revise loop is worth ~6.7 accuracy points and ~8s of tail latency.
+
+**Final config (latency-first — hits the SLO):**
 - vLLM: `--max-num-seqs 256` (+ Phase 1 flags: max-model-len 8192, gpu-mem-util 0.90, chunked prefill)
-- Agent: `uvicorn --workers 4`, `MAX_ITERATIONS = 3` (kept — preserves the verify→revise quality loop)
+- Agent: `uvicorn --workers 4`, `MAX_ITERATIONS = 1`
 
-**Final numbers:** P95 = 11.8s, P50 = 2.5s, achieved ~8.4 RPS (driver-limited), 2612/3000 OK.
-**Quality check:** baseline 40% vs after-tuning ___% — the latency fix (`--workers 4`)
-is a pure infrastructure change to the orchestration layer; the agent logic is
-untouched, so quality is expected to be unchanged (no regression).
-**Verdict:** Bottleneck found and fixed with a ~10× P95 improvement (107.8s → 11.8s)
-while preserving quality. SLO P95 still misses (11.8s vs 5s target, ~2.4×): the
-residual gap is the agent's inherent 2–3 sequential vLLM calls per request. Closing
-it would require cutting the loop (`MAX_ITERATIONS`→1), which trades ~7 points of
-accuracy for tail latency — a trade we chose not to make. (`screenshots/grafana_after.png`)
+**Final numbers:** P95 = **3.83s** (< 5s ✅), P50 = 1.5s, P99 = 6.1s, achieved
+**9.35 RPS**, 2611/3000 OK, 0 client errors.
+**Quality check:** baseline **40%** vs after-tuning **33.3%** — a 6.7-point
+regression. This is the deliberate cost of capping the loop to hit the SLO; the
+latency fix that came *free* (`--workers 4`, no quality change) took P95 from 108s
+to 11.8s, and only the final `MAX_ITERATIONS` cut traded quality for the last
+factor of ~3 in tail latency.
+**Verdict:** **SLO hit** (P95 3.83s < 5s at ~10 RPS over 5 min). The dominant
+bottleneck was the agent orchestration layer, not vLLM — a single synchronous
+uvicorn process. Fixing it with `--workers 4` gave a ~10× improvement at zero
+quality cost; the remaining tail was the agent's own sequential multi-call design,
+closed by capping `MAX_ITERATIONS` at the cost of 6.7 accuracy points.
+(`screenshots/grafana_before.png` → `screenshots/grafana_after.png`)
+
+---
+
+## Agent value — did the loop help?
+
+Yes, measurably, but modestly. The per-iteration pass rate climbs **33.3% → 36.7%
+→ 40.0%** across iterations: on real questions, the verifier catches a wrong first
+SQL (e.g. duplicate rows where the question implies a unique result, or a NULL
+aggregate) and the revise step fixes it — a relative quality gain of ~20% over the
+single-shot baseline. The clearest example is the Australian-Grand-Prix circuit
+query: `generate_sql` returns 11 identical rows, `verify` flags the duplicates, and
+`revise` adds `DISTINCT` to produce the correct single row (visible in
+`screenshots/langfuse_trace.png`). The ceiling, though, is generation quality: most
+questions that fail at iter 0 also fail after revision, because if the first SQL is
+wrong in a way the verifier can't articulate from the rows alone, the reviser has
+nothing actionable to fix. So the loop earns its keep on *detectable* failures
+(bad row shape, errors, empty results) but cannot rescue *semantically* wrong
+queries — which is also exactly why it costs latency without always recovering it.
+
+## What I'd do with more time
+
+- **Make the agent async end-to-end.** The single biggest win in Phase 6 came from
+  agent concurrency (`--workers 4`). The deeper fix is converting the `/answer`
+  endpoint and `graph.invoke` to async so one process handles many in-flight runs
+  without the threadpool ceiling — likely letting us keep `MAX_ITERATIONS=3`
+  (full quality) *and* hit the SLO, instead of trading one for the other.
+- **Add column-level schema descriptions to the prompt.** Several failures were on
+  the `financial` DB with cryptic columns (`A1`–`A16`); the model can't know `A15`
+  means "no. of crimes" without metadata. BIRD ships column descriptions — feeding
+  them in would lift the generation ceiling that currently caps the loop's value.
+- **Give the verifier the gold-row *shape*, not just the rows.** The verifier can
+  catch structural errors but not semantic ones. Passing expected column
+  count/types, or letting it issue a cheap exploratory query, would let revise fix
+  more than duplicate/empty-row cases.
+- **Try FP8 weights to widen the throughput headroom.** We were never memory-bound
+  (KV ~25%, 0 preemptions), so FP8 wasn't needed for *this* SLO — but it would free
+  compute/memory to push past 10 RPS or run higher `MAX_ITERATIONS` within budget.
+- **Cache verify results on identical (schema, SQL, rows).** Repeated/near-identical
+  questions re-pay the verify call; a small cache would cut load at the tail.
