@@ -22,7 +22,7 @@ decision is really a memory decision.
 |---|---|---|
 | `--max-model-len` | `8192` | Prompts are ~3K and outputs short. The model's native 256K context would reserve enormous KV cache per request slot. Capping at 8192 frees KV cache for more concurrent requests → higher achievable RPS. |
 | `--gpu-memory-utilization` | `0.90` | ~60GB of weights leave ~20GB free; raising utilization to 0.90 hands maximum headroom to the KV cache for batching, without tipping into OOM. |
-| `--max-num-seqs` | `64` | Bounds concurrent sequences to keep KV-cache pressure in check while still batching enough to reach the 10+ RPS target. |
+| `--max-num-seqs` | `64` *(initial; raised to 256 in Phase 6)* | Bounds concurrent sequences to keep KV-cache pressure in check while still batching enough to reach the 10+ RPS target. Phase 6 showed this initial cap was too conservative given the idle KV headroom. |
 | `--enable-chunked-prefill` | on | With ~3K-token prompts, prefill is expensive; chunking interleaves prefill with ongoing decode so one long prompt doesn't stall everyone else's generation — improves tail latency under load. |
 
 **Also observed:** vLLM auto-enabled prefix caching (`enable_prefix_caching=True`
@@ -61,7 +61,7 @@ carry-forward for questions that terminated early.
 (+7 points, ~20% relative) across iterations, so the verify→revise loop turns
 some wrong first attempts into correct answers. But most questions that fail at
 generate also fail after revision — the ceiling is generation quality, not
-verification. See `screenshots/grafana_eval_run.png`.
+verification.
 
 ---
 
@@ -134,18 +134,19 @@ closed by capping `MAX_ITERATIONS` at the cost of 6.7 accuracy points.
 ## Agent value — did the loop help?
 
 Yes, measurably, but modestly. The per-iteration pass rate climbs **33.3% → 36.7%
-→ 40.0%** across iterations: on real questions, the verifier catches a wrong first
-SQL (e.g. duplicate rows where the question implies a unique result, or a NULL
-aggregate) and the revise step fixes it — a relative quality gain of ~20% over the
-single-shot baseline. The clearest example is the Australian-Grand-Prix circuit
-query: `generate_sql` returns 11 identical rows, `verify` flags the duplicates, and
-`revise` adds `DISTINCT` to produce the correct single row (visible in
-`screenshots/langfuse_trace.png`). The ceiling, though, is generation quality: most
-questions that fail at iter 0 also fail after revision, because if the first SQL is
-wrong in a way the verifier can't articulate from the rows alone, the reviser has
-nothing actionable to fix. So the loop earns its keep on *detectable* failures
-(bad row shape, errors, empty results) but cannot rescue *semantically* wrong
-queries — which is also exactly why it costs latency without always recovering it.
+→ 40.0%** — a ~20% relative gain over the single-shot baseline. The clearest example
+is the Australian-Grand-Prix circuit query: `generate_sql` returns 11 identical
+rows, `verify` flags the duplicates, and `revise` adds `DISTINCT` to produce the
+correct single row (visible in `screenshots/langfuse_trace.png`).
+
+The ceiling, though, is generation quality: most questions that fail at iter 0 also
+fail after revision. If the first SQL is wrong in a way the verifier can't tell from
+the rows alone — e.g. the `financial` "average crimes" query picks the wrong cryptic
+column (`A14`) and returns a NULL average — the reviser has nothing actionable to
+fix and the loop burns its iterations without recovering. So the loop earns its keep
+on *detectable* failures (duplicate rows, errors, empty results) but can't rescue
+*semantically* wrong queries — which is also why it costs latency without always
+recovering it.
 
 ## What I'd do with more time
 
@@ -162,8 +163,3 @@ queries — which is also exactly why it costs latency without always recovering
   catch structural errors but not semantic ones. Passing expected column
   count/types, or letting it issue a cheap exploratory query, would let revise fix
   more than duplicate/empty-row cases.
-- **Try FP8 weights to widen the throughput headroom.** We were never memory-bound
-  (KV ~25%, 0 preemptions), so FP8 wasn't needed for *this* SLO — but it would free
-  compute/memory to push past 10 RPS or run higher `MAX_ITERATIONS` within budget.
-- **Cache verify results on identical (schema, SQL, rows).** Repeated/near-identical
-  questions re-pay the verify call; a small cache would cut load at the tail.
